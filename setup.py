@@ -404,6 +404,9 @@ SPLIT_PROMPT_VRAM_GB = 12                               # #448: a split stage le
                                                         # own cache; below this one cannot fund a 4096-token chunk
                                                         # (a 10 GB RTX 3080 beside a 32 GB card: 512 tokens, prompts
                                                         # 6.2x slower), while the big card alone could
+# Kept opt-in: the release builds and upstream installer intentionally target
+# Turing and newer.  CMake has a separately maintained fallback for Pascal / Volta.
+EXPERIMENTAL_PASCAL = os.environ.get("STRATA_EXPERIMENTAL_PASCAL", "").strip().lower() in ("1", "on", "true", "yes")
 
 
 def cc(g) -> str:
@@ -413,7 +416,7 @@ def cc(g) -> str:
 def experimental_sm60() -> bool:
     """#295: STRATA_EXPERIMENTAL_SM60=1 admits Pascal (6.x) and Volta (7.0) cards: the community build
     (-DSTRATA_EXPERIMENTAL_SM60=ON, compiled here with a CUDA 12.x toolkit), not the ready-made engine."""
-    return os.environ.get("STRATA_EXPERIMENTAL_SM60", "").strip() == "1"
+    return EXPERIMENTAL_PASCAL or os.environ.get("STRATA_EXPERIMENTAL_SM60", "").strip() == "1"
 
 
 def sm60_card(arch) -> bool:
@@ -422,10 +425,13 @@ def sm60_card(arch) -> bool:
 
 def gpu_problem(g, together=False):
     """Why Strata cannot use this card, in plain words (None: it can)."""
-    if int(g["arch"]) < 75 and not (sm60_card(g["arch"]) and experimental_sm60()):
+    arch = int(g["arch"])
+    if arch < 60:
+        return (f"not supported - compute capability {cc(g)} is below 6.0, the minimum even for the experimental "
+                "Pascal / Volta build")
+    if arch < 75 and not (sm60_card(arch) and experimental_sm60()):
         return (f"not supported - older than the RTX 20 series (compute capability {cc(g)}; Strata needs 7.5 or "
-                "newer" + ("; STRATA_EXPERIMENTAL_SM60=1 tries the community build for it" if sm60_card(g["arch"])
-                          else "") + ")")
+                "newer; rerun with --experimental-pascal to build the unsupported Pascal / Volta path)")
     if together and g["vram_gb"] < SPLIT_MIN_VRAM_GB - 0.5:
         return (f"not supported together with other GPUs - {g['vram_gb']:.0f} GB of VRAM (a card sharing the model "
                 f"needs {SPLIT_MIN_VRAM_GB} GB or more)")
@@ -1977,7 +1983,9 @@ def build_engine(gpu, vision, yes, llama) -> Path:
     # a card the engine has no code for (a GPU added with --gpus, #128) needs a compile even when the source is the
     # same; the compile keeps the generations it was built for
     new_arch = local and not set(archs) <= built
-    engine_ok = local and (eng / EXE).exists() and meta.get("src") == src and not new_arch
+    legacy = any(int(x) < 75 for x in archs)
+    engine_ok = (local and (eng / EXE).exists() and meta.get("src") == src and not new_arch and
+                 bool(meta.get("experimental_pascal")) == legacy)
     vision_ok = not want_vision or ((eng / VEXE).exists() and (not local or meta.get("vision_src") == vsrc))
     if engine_ok and vision_ok:
         ok("engine already built for this PC")
@@ -1993,8 +2001,8 @@ def build_engine(gpu, vision, yes, llama) -> Path:
             if local and (eng / EXE).exists() else "  Compiling the Strata engine for your GPU (10-20 minutes, once) ...")
         cmake_build(ROOT, ROOT / "build", "strata",
                     ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF", f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}",
-                     f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}", *engine_defs(archs)],
-                    vcvars, "build-strata.bat")
+                     f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}",
+                     *( ["-DSTRATA_EXPERIMENTAL_SM60=ON", "-DCMAKE_CUDA_RUNTIME_LIBRARY=Shared"] if legacy else [] )], vcvars, "build-strata.bat")
         shutil.copy2(ROOT / "build" / EXE, eng / EXE)
     if not vision_ok:
         say("  Compiling the image encoder" + (" with CUDA (10-20 minutes, once) ..." if vision == "gpu" else " ..."))
@@ -2006,6 +2014,7 @@ def build_engine(gpu, vision, yes, llama) -> Path:
     bindir = Path(nvcc).parent                            # the toolkit's own libraries (bin, bin/x64, lib64)
     dirs = [str(d) for d in (bindir, bindir / "x64", bindir.parent / "lib64") if d.is_dir()]
     stamp.write_text(json.dumps({"source": "local", "version": source_version(), "archs": archs,
+                                 "experimental_pascal": legacy,
                                  "vision": vision,
                                  "cuda_dirs": dirs, "src": src, "vision_src": vsrc if want_vision else None}, indent=1))
     ok(f"engine compiled: {eng / EXE}")
@@ -2613,7 +2622,11 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
           layer_split=None, keep=None) -> int:
     """keep: settings given on this start that the model keeps from now on (--host, --api-key, --draft-vocab,
     --vram-reserve-mib)."""
+    global EXPERIMENTAL_PASCAL
     cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
+    # A normal double-click start has no command-line flags.  Preserve the explicit
+    # experimental choice made during setup so its Pascal build remains selectable.
+    EXPERIMENTAL_PASCAL = EXPERIMENTAL_PASCAL or bool(cfg.get("experimental_pascal"))
     missing = [p for p in [cfg["exe"], *[a for a in cfg["args"] if a.endswith(".gguf")]] if not Path(p).exists()]
     if missing:
         fail(f"{cfg_path.name} refers to missing files: {missing[0]}", "run it again with --setup to repair")
@@ -2960,6 +2973,9 @@ def main() -> int:
                     help="update the installed engine, Python packages and model settings as a start would, without "
                          "starting the model (UPDATE.bat / update.sh run it after a git pull)")
     ap.add_argument("--build", action="store_true", help="compile the engine instead of using the ready-made one")
+    ap.add_argument("--experimental-pascal", action="store_true",
+                    help="EXPERIMENTAL/UNSUPPORTED: allow compute capability 6.x/7.0 GPUs and compile the CUDA 12 "
+                         "Pascal/Volta fallback. Requires a local CUDA 12 toolkit; no ready-made engine is used")
     ap.add_argument("--prebuilt", default=os.environ.get("STRATA_PREBUILT_URL", PREBUILT_URL),
                     help="where the ready-made engine is (a URL folder or a local folder)")
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
@@ -2988,6 +3004,8 @@ def main() -> int:
                          "Linux or Windows (chosen by itself when the PC has no NVIDIA card Strata can use)")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
+    global EXPERIMENTAL_PASCAL
+    EXPERIMENTAL_PASCAL = EXPERIMENTAL_PASCAL or a.experimental_pascal
     if a.resident_budget_gib is not None and not a.resident_budget_gib > 0:
         ap.error("--resident-budget-gib takes a number of GiB above 0, e.g. --resident-budget-gib 32")
     if a.vram_reserve_mib is not None and a.vram_reserve_mib < 0:
@@ -3629,6 +3647,8 @@ def main() -> int:
     cfg = {"exe": str(eng / EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": f"{fam['name']}-{model.lower()}", "log": str(ROOT / f"strata-{tag.lower()}.log"),
            "lib_dirs": lib_dirs, "port": port}
+    if EXPERIMENTAL_PASCAL:
+        cfg["experimental_pascal"] = True
     if hip:
         cfg["backend"] = "hip"
         # the dense prompt GEMMs through hipBLASLt with kernels measured on this GPU generation (tools/hip; +40-60%

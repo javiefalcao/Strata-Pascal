@@ -598,7 +598,10 @@ function renderChat() {
   messages.forEach((m, i) => chat.appendChild(msgEl(m, i)));
   scrollDown(true);
 }
-function nearBottom() { const s = $("chat-scroll"); return s.scrollHeight - s.scrollTop - s.clientHeight < 120; }
+// Follow a stream only while the reader is actually at the bottom.  A one-pixel
+// tolerance covers fractional layout/scroll rounding; any deliberate upward move
+// immediately gives the scrollbar back to the reader.
+function nearBottom() { const s = $("chat-scroll"); return s.scrollHeight - s.scrollTop - s.clientHeight <= 1; }
 function scrollDown(force) { const s = $("chat-scroll"); if (force || nearBottom()) s.scrollTop = s.scrollHeight; }
 
 $("chat").addEventListener("click", (e) => {
@@ -695,7 +698,15 @@ async function send() {
   if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
 
   let firstAt = null, thinkStart = null, usage = null, frame = 0;
-  const paint = () => { frame = 0; updateAssistant(el, m, true); scrollDown(); };
+  // Remember whether the reader was following the stream *before* this paint grows
+  // the message.  Checking afterwards makes a long thinking block look as though the
+  // reader scrolled away, so the page stops following it after its first update.
+  const paint = () => {
+    frame = 0;
+    const follow = nearBottom();
+    updateAssistant(el, m, true);
+    scrollDown(follow);
+  };
   try {
     const r = await fetch("v1/chat/completions", {method: "POST", headers: headers(true), body: JSON.stringify(body),
                                                    signal: controller.signal});
@@ -760,9 +771,10 @@ async function send() {
   busy = null;
   setBusy(false);
   if (frame) cancelAnimationFrame(frame);
+  const follow = nearBottom();
   updateAssistant(el, m, false);
   saveChat();
-  scrollDown();
+  scrollDown(follow);
 }
 
 $("composer").onsubmit = (e) => { e.preventDefault(); send(); };
